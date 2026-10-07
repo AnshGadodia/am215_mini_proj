@@ -1,0 +1,6 @@
+# Generated datasets
+/data/*.csv
+
+# Python environments
+.venv/
+__pycache__/
