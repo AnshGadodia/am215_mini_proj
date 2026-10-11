@@ -1,6 +1,10 @@
-# Generated datasets
 /data/*.csv
-
-# Python environments
-.venv/
 __pycache__/
+*.pyc
+.DS_Store
+*.zip
+.ipynb_checkpoints/
+.venv/
+dist/
+*.egg-info/
+
