@@ -1,56 +1,181 @@
+
 import io
-import requests
-import yfinance as yf
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
+import requests
+import yfinance as yf
 
-# 1. Fetch S&P 500 tickers dynamically from Wikipedia
-url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-headers = {"User-Agent": "Mozilla/5.0"}
-response = requests.get(url, headers=headers)
-sp500_table = pd.read_html(io.StringIO(response.text))[0]
+# Configuration
+SELECTION_START = "2016-08-01"
+SELECTION_END = "2021-08-01"  # Exclusive
+PRICE_END = "2026-10-01"      # Exclusive
+BACKTEST_START = "2021-09-01"
+NUM_STOCKS = 30
+BATCH_SIZE = 50
 
-# Yahoo Finance uses '-' instead of '.' (e.g., BRK-B instead of BRK.B)
-tickers = sp500_table["Symbol"].str.replace(".", "-", regex=False).tolist()
+# Root-level data directory
+DATA_DIR = Path(__file__).resolve().parents[3] / "data"
+DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-# Maps for company name and sector
-ticker_to_name = dict(zip(tickers, sp500_table["Security"]))
-ticker_to_sector = dict(zip(tickers, sp500_table["GICS Sector"]))
 
-print(f"Loaded {len(tickers)} tickers. Downloading price data...")
+def get_historical_constituents():
+    """Get S&P 500 constituents from July 2021."""
+    url = (
+        "https://raw.githubusercontent.com/"
+        "pierrebrunelle/sp500-historical-constituents/"
+        "main/data/spy202107"
+    )
 
-# 2. Download 5 years of daily adjusted prices
-prices = yf.download(
-    tickers,
-    start="2021-09-30",
-    end="2026-09-30",
-    auto_adjust=True,
-    progress=True
-)["Close"]
+    response = requests.get(url, timeout=30)
+    response.raise_for_status()
 
-# Drop any stocks that don't have full 5-year history / have missing data
-prices = prices.dropna(axis=1)
+    constituents = pd.read_csv(
+        io.StringIO(response.text),
+        sep="\t",
+        header=None,
+        names=["Ticker", "Company", "Weight"],
+    )
 
-# 3. Standard (simple) daily returns
-returns = prices.pct_change()
+    # Convert ticker notation for Yahoo Finance
+    constituents["Ticker"] = (
+        constituents["Ticker"]
+        .str.replace("/", "-", regex=False)
+        .str.replace(".", "-", regex=False)
+    )
 
-# 4. Annualized volatility
-volatility = returns.std() * np.sqrt(252)
+    return constituents
 
-# 5. Rank from lowest to highest
-volatility = volatility.sort_values()
 
-# 30 lowest-volatility stocks
-lowest_30 = volatility.head(30)
+def download_prices(tickers, start, end):
+    """Download adjusted closing prices in batches."""
+    batches = []
 
-summary_df = pd.DataFrame({
-    "Rank": range(1, 31),
-    "Ticker": lowest_30.index,
-    "Company": [ticker_to_name.get(t, "N/A") for t in lowest_30.index],
-    "Sector": [ticker_to_sector.get(t, "N/A") for t in lowest_30.index],
-    "Annualized Vol": lowest_30.values.round(4),
-    "Vol (%)": (lowest_30.values * 100).round(2).astype(str) + "%"
-})
+    for i in range(0, len(tickers), BATCH_SIZE):
+        batch = tickers[i:i + BATCH_SIZE]
 
-print("\nTop 30 Lowest Volatility S&P 500 Stocks (5-Year):")
-print(summary_df.to_string(index=False))
+        print(
+            f"Downloading batch "
+            f"{i // BATCH_SIZE + 1}/"
+            f"{(len(tickers) + BATCH_SIZE - 1) // BATCH_SIZE}"
+        )
+
+        try:
+            data = yf.download(
+                batch,
+                start=start,
+                end=end,
+                auto_adjust=True,
+                progress=False,
+                threads=True,
+            )
+
+            if data.empty:
+                continue
+
+            close = data["Close"]
+
+            if isinstance(close, pd.Series):
+                close = close.to_frame(name=batch[0])
+
+            batches.append(close)
+
+        except Exception as exc:
+            print(f"Batch failed: {exc}")
+
+    if not batches:
+        raise RuntimeError("No stock prices downloaded.")
+
+    prices = pd.concat(batches, axis=1)
+    return prices.sort_index()
+
+
+def main():
+    # 1. Historical S&P 500 constituents
+    constituents = get_historical_constituents()
+
+    tickers = constituents["Ticker"].tolist()
+    ticker_to_name = dict(
+        zip(constituents["Ticker"], constituents["Company"])
+    )
+
+    print(f"Loaded {len(tickers)} historical S&P 500 tickers.")
+
+    # 2. Download selection and evaluation data
+    prices = download_prices(
+        tickers,
+        start=SELECTION_START,
+        end=PRICE_END,
+    )
+
+    # 3. Restrict selection to pre-backtest data
+    selection_prices = prices.loc[
+        SELECTION_START:"2021-07-31"
+    ]
+
+    # Require complete selection-window histories
+    selection_prices = selection_prices.dropna(axis=1)
+
+    # 4. Calculate annualized historical volatility
+    returns = selection_prices.pct_change(fill_method=None)
+
+    volatility = returns.std() * np.sqrt(252)
+    volatility = volatility.dropna().sort_values()
+
+    if len(volatility) < NUM_STOCKS:
+        raise RuntimeError(
+            f"Only {len(volatility)} eligible stocks found; "
+            f"need {NUM_STOCKS}."
+        )
+
+    # 5. Select the lowest-volatility stocks
+    lowest_30 = volatility.head(NUM_STOCKS)
+
+    summary_df = pd.DataFrame({
+        "Rank": range(1, NUM_STOCKS + 1),
+        "Ticker": lowest_30.index,
+        "Company": [
+            ticker_to_name.get(t, "N/A")
+            for t in lowest_30.index
+        ],
+        "Annualized Vol": lowest_30.values.round(4),
+        "Vol (%)": (
+            (lowest_30.values * 100)
+            .round(2)
+            .astype(str) + "%"
+        ),
+    })
+
+    # 6. Save selected stock information
+    summary_path = DATA_DIR / "lowest_30_stocks.csv"
+    summary_df.to_csv(summary_path, index=False)
+
+    # 7. Save prices from August 2021 onward
+    selected_prices = prices.loc[
+        "2021-08-01":"2026-09-30",
+        lowest_30.index,
+    ]
+
+    price_path = DATA_DIR / "stock_prices.csv"
+    selected_prices.to_csv(
+        price_path,
+        index_label="Date",
+    )
+
+    # 8. Report missing evaluation data
+    missing = selected_prices.isna().sum()
+    if missing.any():
+        print("\nMissing price observations by stock:")
+        print(missing[missing > 0].to_string())
+
+    print("\n30 Lowest-Volatility S&P 500 Stocks:")
+    print(summary_df.to_string(index=False))
+
+    print(f"\nSaved stock list: {summary_path}")
+    print(f"Saved stock prices: {price_path}")
+    print(f"Backtest begins: {BACKTEST_START}")
+
+
+if __name__ == "__main__":
+    main()
